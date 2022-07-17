@@ -1,0 +1,55 @@
+drop table if exists status;
+create temp table status as
+
+select primary_monolith_main_patient_id as patient_id,
+       booker_type
+  from
+  (
+  select primary_monolith_main_patient_id,
+         booker_type,
+         rank () over (partition by primary_monolith_main_patient_id order by session_start_timestamp_utc desc) as rnk --the first status up until the holdout started
+    from user_behavior.session
+   where session_start_timestamp_utc::date between '2021-01-01' and '2022-03-06'
+  ) t1
+where rnk = 1
+;
+
+select
+  a.variant,
+  count(distinct a.patientid) as num_users,
+  count(distinct c.session_id) as num_sessions, -- needs count distinct bc a session can lead to multiple appointments
+  count(b.appointment_id) as num_bookings,
+  count(distinct d.session_id) as ebf_sessions,
+  count(distinct b.session_id) as appt_sessions,
+  count(case when e.is_initially_premium_eligible_at_booking then b.appointment_id end) as IPE_bookings,
+  count(case when e.is_premium_eligible then b.appointment_id end) as PE_bookings,
+  count(case when b.latest_appointment_time_utc < current_date then b.appointment_id end) as past_bookings,
+  count(case when b.appointment_outcome = 'RealizedAppointment' THEN b.appointment_id END) AS realized_bookings,
+  count(case when b.appointment_outcome = 'Cancelled' and b.cancellation_initiator = 'Patient' THEN b.appointment_id END) AS patient_cancelled_bookings,
+  count(case when b.appointment_outcome = 'Cancelled' and b.cancellation_initiator = 'Provider' THEN b.appointment_id END) AS provider_cancelled_bookings,
+  count(case when b.appointment_outcome = 'NoShow' THEN b.appointment_id END) AS noshow_bookings,
+  sum(b.realized_cost) as revenue,
+  sum(case when e.is_premium_eligible then b.plan_cost end) as imputed_revenue,
+  count(distinct b.monolith_patient_id) as num_patients
+from cistern_experimental.experimental.jq_patient_crm_holdout a
+left join user_behavior.session c
+    on a.patientid = c.primary_monolith_main_patient_id
+    and c.is_reporting_session
+    and c.session_start_timestamp_utc between '2022-03-07' and dateadd('day',90,'2022-03-07')
+left join appointment.appointment_summary b
+    on a.patientid = b.monolith_main_patient_id
+    and not b.is_covid_vaccine_booking
+    and b.is_created_appointment
+    and b.appointment_created_timestamp_utc >= '2022-01-01'
+    and c.session_id = b.session_id
+left join (select distinct session_id from user_behavior.enter_booking_flow where timestamp_utc >= '2022-01-01') d
+    on c.session_id = d.session_id
+left join appointment.appointment_summary_premium_eligible_vw e
+    on b.appointment_id = e.appointment_id
+left join status s
+    on a.patientid = s.patient_id
+where a.variant in ('Send', 'AdHoc', 'Overall') 
+and s.patient_id is null -- inactive user
+group by 1
+order by 1
+;
